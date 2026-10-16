@@ -1,105 +1,79 @@
 import os
-from typing import List, Optional
-import yaml
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
+import httpx
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from openai import OpenAI
 
 app = FastAPI()
 
-# Enable CORS for cross-origin requests from any page/browser
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Configuration
+QUESTION_DATA_URL = "https://exam.sanand.workers.dev/questionData?email=24f3001844%40ds.study.iitm.ac.in&quizSign=P6%2F7rV%2BYfZ9bG5y%2ByVn8DFZ92U4m%2FJDx0o5%2BEjJy2X%2BTErAifh4Y2Us6hcVzleHiBMnQA346Q2U7VVBfaXz5lLEhA9I4943LxVnUGS671WY5842OqCSVcw0JdSmz8DOQWJB5S7Orp8miv9sJu2SFRbDdhZIIlYiGISMNXSgknK44q9FbkfRU01Un0BO4awtSnxvbMbQjkNnFfiml4qYb7OjxCvT5KOuiypbQ9XSP%2B%2BDSYuA9t989EsfeFkTwPPuEGPy3uIw%2BLxdUFfbbBHW1mO10X8TmJaKSLVZr1DI3f1oSfBEynnnj%2ByBtEw1sPtIG9zn2huuFBwQHQBC4KA47og%3D%3D&questionId=q-ledger-agent-server&path=/"
 
+class QuestionRequest(BaseModel):
+    question: str
 
-def coerce_value(key: str, value: str):
-  """Applies type coercion rules based on the key name."""
-  if value is None:
-    return None
+# Cache the ledger data globally or fetch on demand
+ledger_cache = None
 
-  if key in ("port", "workers"):
+async def fetch_ledger_data():
+    global ledger_cache
+    if ledger_cache is not None:
+        return ledger_cache
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(QUESTION_DATA_URL, timeout=30.0)
+            response.raise_for_status()
+            ledger_cache = response.json()
+            return ledger_cache
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to fetch ledger data: {str(e)}")
+
+@app.post("/")
+async def answer_question(req: QuestionRequest):
+    data = await fetch_ledger_data()
+    
+    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    
+    prompt = f"""
+You are an expert data analyst assistant for Acme Appliances. 
+You have been given raw ledger/order data from the company's API.
+Your job is to answer the user's question accurately based entirely on this data.
+
+Ledger Data Summary/Content:
+{str(data)[:15000]}  # Truncate if necessary or pass structured context
+
+User Question: {req.question}
+
+Rules:
+- Money must be in USD, rounded correctly to the cent (e.g., 1234.56).
+- Product names must match exactly as spelled in the API.
+- Return ONLY the precise answer requested, formatted appropriately (plain number, string, list, or JSON as expected).
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You provide exact, concise answers to data queries based on provided context."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.0
+    ]
+    
+    answer_text = response.choices[0].message.content.strip()
+    
+    # Try to parse as JSON/number if possible, otherwise return as string
     try:
-      return int(value)
-    except ValueError:
-      return value
+        import json
+        parsed_answer = json.loads(answer_text)
+    except:
+        # Try converting to float/int if it looks like a number
+        try:
+            if "." in answer_text:
+                parsed_answer = float(answer_text)
+            else:
+                parsed_answer = int(answer_text)
+        except ValueError:
+            parsed_answer = answer_text
 
-  if key == "debug":
-    if isinstance(value, bool):
-      return value
-    return str(value).lower() in ("true", "1", "yes", "on")
-
-  return str(value)
-
-
-@app.get("/effective-config")
-def get_effective_config(
-    set: Optional[List[str]] = Query(
-        None, description="CLI overrides in key=value format"
-    )
-):
-  # Layer 1: Hardcoded defaults
-  config = {
-      "port": 8000,
-      "workers": 1,
-      "debug": False,
-      "log_level": "info",
-      "api_key": "default-secret-000",
-  }
-
-  # Layer 2: config.development.yaml (if present)
-  yaml_path = "config.development.yaml"
-  if os.path.exists(yaml_path):
-    try:
-      with open(yaml_path, "r") as f:
-        yaml_data = yaml.safe_load(f) or {}
-        for k, v in yaml_data.items():
-          config[k] = coerce_value(k, v)
-    except Exception:
-      pass
-
-  # Layer 3: .env file or environment variables simulation
-  # Handling alias: NUM_WORKERS -> workers
-  env_mapping = {
-      "APP_PORT": "port",
-      "APP_WORKERS": "workers",
-      "NUM_WORKERS": "workers",
-      "APP_DEBUG": "debug",
-      "APP_LOG_LEVEL": "log_level",
-      "APP_API_KEY": "api_key",
-  }
-  for env_key, cfg_key in env_mapping.items():
-    val = os.getenv(env_key)
-    if val is not None:
-      config[cfg_key] = coerce_value(cfg_key, val)
-
-  # Layer 4: OS env vars (APP_* prefix)
-  for env_key, val in os.environ.items():
-    if env_key.startswith("APP_"):
-      cfg_key = env_key[4:].lower()
-      if cfg_key in config or cfg_key in ("port", "workers", "debug", "log_level", "api_key"):
-        config[cfg_key] = coerce_value(cfg_key, val)
-
-  # Layer 5: CLI overrides via ?set=key=value query parameters (Highest Precedence)
-  if set:
-    for override in set:
-      if "=" in override:
-        k, v = override.split("=", 1)
-        k = k.strip()
-        v = v.strip()
-        config[k] = coerce_value(k, v)
-
-  # Ensure correct types on all baseline keys
-  config["port"] = coerce_value("port", config.get("port", 8000))
-  config["workers"] = coerce_value("workers", config.get("workers", 1))
-  config["debug"] = coerce_value("debug", config.get("debug", False))
-  config["log_level"] = str(config.get("log_level", "info"))
-
-  # Secret masking: api_key must always appear as "****"
-  config["api_key"] = "****"
-
-  return config
+    return {"answer": parsed_answer}
